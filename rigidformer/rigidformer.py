@@ -3,7 +3,7 @@ from collections import namedtuple
 
 import torch
 import torch.nn.functional as F
-from torch import nn, cat, stack, tensor
+from torch import nn, cat, stack, tensor, Tensor
 from torch.nn import Module, ModuleList, Linear, Parameter
 
 import einx
@@ -52,6 +52,43 @@ class FiLM(Module):
 
         scaled = einx.add('b n d, b d', normed, gamma + 1.)
         return einx.add('b n d, b d', scaled, beta)
+
+# attention residual pooler
+
+class AttentionResidualPool(Module):
+    def __init__(
+        self,
+        dim
+    ):
+        super().__init__()
+        self.scale = dim ** -0.5
+        self.queries = nn.Parameter(torch.randn(dim) * 1e-2)
+
+        self.key_rmsnorm = nn.RMSNorm(dim)
+
+    def forward(
+        self,
+        hiddens: list[Tensor], # [(b n d)]
+    ):
+        assert len(hiddens) > 0
+
+        layer_hiddens = stack(hiddens, dim = -2)
+
+        # queries, keys, values
+
+        q, k, v = self.queries, self.key_rmsnorm(layer_hiddens), layer_hiddens
+
+        q = q * self.scale
+
+        # attention
+
+        sim = einsum(q, k, 'd, b n l d -> b n l')
+
+        attn = sim.softmax(dim = -1)
+
+        out = einsum(attn, v, 'b n l, b n l d -> b n d')
+
+        return out
 
 # classes
 
@@ -174,7 +211,9 @@ class Rigidformer(Module):
             attn_film = FiLM(dim, 2)
             ff_film = FiLM(dim, 2)
 
-            layers.append(ModuleList([attn_film, attn, ff_film, ff]))
+            attn_residual = AttentionResidualPool(dim)
+
+            layers.append(ModuleList([attn_film, attn, ff_film, ff, attn_residual]))
 
         self.self_attn_layers = layers
         self.register_tokens = Parameter(torch.randn(num_register_tokens, dim) * 1e-2)
@@ -203,7 +242,9 @@ class Rigidformer(Module):
             attn_film = FiLM(dim, 2)
             ff_film = FiLM(dim, 2)
 
-            layers.append(ModuleList([attn_film, attn, ff_film, ff]))
+            attn_residual = AttentionResidualPool(dim)
+
+            layers.append(ModuleList([attn_film, attn, ff_film, ff, attn_residual]))
 
         self.cross_attn_layers = layers
 
@@ -251,7 +292,7 @@ class Rigidformer(Module):
 
         object_hiddens = [object_tokens]
 
-        for attn_film, attn, ff_film, ff in self.self_attn_layers:
+        for attn_film, attn, ff_film, ff, attn_residual in self.self_attn_layers:
 
             filmed = attn_film(object_tokens, time_cond)
             object_tokens = attn(filmed) + object_tokens
@@ -259,21 +300,29 @@ class Rigidformer(Module):
             filmed = ff_film(object_tokens, time_cond)
             object_tokens = ff(object_tokens) + object_tokens
 
-            # remove the register tokens from the ensuing cross attention
+            object_hiddens.append(object_tokens)
 
-            _, layer_hiddens = inverse_pack_registers(object_tokens)
-            object_hiddens.append(layer_hiddens)
+            object_tokens = attn_residual(object_hiddens)
 
         # anchor cross attention
 
+        anchor_hiddens = [anchor_tokens]
+
         object_contexts = [object_hiddens[layer] for layer in self.object_hidden_layers] # gather all the object self attention hidden layers for cross attending
 
-        for (attn_film, attn, ff_film, ff), object_context in zip(self.cross_attn_layers, object_contexts):
+        for (attn_film, attn, ff_film, ff, attn_residual), object_context in zip(self.cross_attn_layers, object_contexts):
+
+            _, object_context = inverse_pack_registers(object_context) # remove register tokens
+
             filmed = attn_film(anchor_tokens, time_cond)
             anchor_tokens = attn(filmed, context = object_context) + anchor_tokens
 
             filmed = ff_film(anchor_tokens, time_cond)
             anchor_tokens = ff(filmed) + anchor_tokens
+
+            anchor_hiddens.append(anchor_tokens)
+
+            anchor_tokens = attn_residual(anchor_hiddens)
 
         pred_acc = self.to_acc_pred(anchor_tokens)
 
