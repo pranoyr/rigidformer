@@ -13,6 +13,8 @@ from einops.layers.torch import Rearrange
 
 from torch_einops_utils import pack_with_inverse, maybe, pad_left_at_dim
 
+from x_mlps_pytorch import MLP
+
 import roma
 
 # constants
@@ -305,6 +307,8 @@ class Rigidformer(Module):
 
         self.anchor_vertex_pool = AnchorVertexPool(**anchor_vertex_pool_kwargs)
 
+        self.pooled_object_to_anchor = MLP(dim, dim * 4, dim)
+
         # rotary embeddings
 
         self.rope_3d = AxialRotaryEmbeddings(dim_head, **axial_rope_kwargs)
@@ -406,7 +410,9 @@ class Rigidformer(Module):
         assert exists(anchor_indices) or (exists(anchor_tokens) and exists(anchor_pos))
 
         if not exists(anchor_pos):
-            anchor_tokens, anchor_pos = self.anchor_vertex_pool(object_tokens, object_pos, anchor_indices)
+            pooled_object_tokens, anchor_pos = self.anchor_vertex_pool(object_tokens, object_pos, anchor_indices)
+
+            anchor_tokens = self.pooled_object_to_anchor(pooled_object_tokens)
 
         # time conditioning
 
