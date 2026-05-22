@@ -10,7 +10,7 @@ import einx
 from einops import einsum, rearrange, repeat, pack
 from einops.layers.torch import Rearrange
 
-from torch_einops_utils import pack_with_inverse, maybe
+from torch_einops_utils import pack_with_inverse, maybe, pad_left_at_dim
 
 import roma
 
@@ -27,6 +27,49 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def divisible_by(num, den):
+    return (num % den) == 0
+
+# tensor helpers
+
+def mean_and_expand_back(t, dim):
+    shape = t.shape
+    t = t.mean(dim = dim, keepdim = True)
+    return t.expand(shape)
+
+# 3d axial rotary embeddings
+# the anchor rope mentioned is simply where they mean pool rotary embeddings for the 4 anchors, iiuc
+
+class AxialRotaryEmbeddings(Module):
+    def __init__(
+        self,
+        dim,
+        omega = 10_000
+    ):
+        super().__init__()
+        assert divisible_by(dim, 6), f'{dim} must be divisible by 6'
+        inv_freq = omega ** (-torch.arange(0, dim, 6).float() / dim)
+        self.register_buffer('inv_freq', inv_freq)
+
+    @property
+    def device(self):
+        return self.inv_freq.device
+
+    def forward(
+        self,
+        pos, # (... 3)
+    ):
+        freqs = einsum(pos, self.inv_freq, '... p, f -> ... p f')
+        freqs = rearrange(freqs, 'b ... p f -> b 1 ... (p f)')
+        return cat((freqs, freqs), dim = -1)
+
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim = -1)
+    return torch.cat((-x2, x1), dim = -1)
+
+def apply_rotary_pos_emb(pos, t):
+    return t * pos.cos() + rotate_half(t) * pos.sin()
 
 # film
 
@@ -123,7 +166,9 @@ class Attention(Module):
     def forward(
         self,
         tokens,
-        context = None
+        context = None,
+        rotary_pos_emb = None,
+        context_rotary_pos_emb = None
     ):
 
         context = default(context, tokens)
@@ -138,6 +183,12 @@ class Attention(Module):
         if self.has_qk_rmsnorm:
             queries, keys = tuple(self.qk_rmsnorm(t) for t in (queries, keys))
             queries, keys = tuple(einx.multiply('b h n d, h d', t, scale) for t, scale in zip((queries, keys), self.qk_rmsnorm_scales))
+
+        if exists(rotary_pos_emb):
+            context_rotary_pos_emb = default(context_rotary_pos_emb, rotary_pos_emb)
+
+            queries = apply_rotary_pos_emb(rotary_pos_emb, queries)
+            keys = apply_rotary_pos_emb(context_rotary_pos_emb, keys)
 
         sim = einsum(queries, keys, 'b h i d, b h j d -> b h i j') * self.scale
 
@@ -180,7 +231,7 @@ class Rigidformer(Module):
     def __init__(
         self,
         dim,
-        dim_head = 128,
+        dim_head = 192,
         heads = 6,
         ff_expansion = 2.5,
         num_register_tokens = 16,
@@ -189,8 +240,18 @@ class Rigidformer(Module):
         object_hidden_layers: tuple[int, ...] = (0, 1, 2, 4),  # the hidden object layer outputs that the anchor decoder cross attends to
         pos_loss_weight = 10.,
         acc_loss_weight = 1.,
+        axial_rope_kwargs: dict = dict(
+            omega = 10_000
+        ),
+        register_pos = -1000. # unsure what position to give the registers, so just make it far away
     ):
         super().__init__()
+
+        # rotary embeddings
+
+        self.rope_3d = AxialRotaryEmbeddings(dim_head, **axial_rope_kwargs)
+
+        self.register_pos = register_pos # todo - spend some time building / vibing a custom kernel for both rope and pope to be able to omit rotary for certain tokens (registers / cls etc)
 
         # object self attention related
 
@@ -218,6 +279,8 @@ class Rigidformer(Module):
             layers.append(ModuleList([attn_film, attn, ff_film, ff, attn_residual]))
 
         self.self_attn_layers = layers
+
+        self.num_register_tokens = num_register_tokens
         self.register_tokens = Parameter(torch.randn(num_register_tokens, dim) * 1e-2)
 
         # anchor cross attention related
@@ -269,12 +332,13 @@ class Rigidformer(Module):
     def forward(
         self,
         object_tokens,           # (b no d)
-        anchor_tokens,           # (b na d)
+        anchor_tokens,           # (b no na d)
         *,
         delta_times,             # (b)
-        anchor_pos = None,       # (b na 3)
-        anchor_pos_prev = None,  # (b na 3)
-        anchor_pos_next = None   # (b na 3)
+        object_pos,              # (b no 3)
+        anchor_pos,              # (b no na 3)
+        anchor_pos_prev = None,  # (b no na 3)
+        anchor_pos_next = None   # (b no na 3)
     ):
         batch = object_tokens.shape[0]
 
@@ -290,6 +354,18 @@ class Rigidformer(Module):
 
         object_tokens, inverse_pack_registers = pack_with_inverse((registers, object_tokens), 'b * d')
 
+        # object rotary embeddings
+
+        object_rotary_pos_emb = self.rope_3d(object_pos)
+
+        object_rotary_pos_emb_with_registers = pad_left_at_dim(object_rotary_pos_emb, self.num_register_tokens, dim = -2, value = self.register_pos)
+
+        # handle the "ARoPE" - all anchors for the same object share the same mean pooled positional embedding, it seems
+
+        anchor_rotary_pos_emb = self.rope_3d(anchor_pos)
+        anchor_rotary_pos_emb = mean_and_expand_back(anchor_rotary_pos_emb, dim = -2) # (b no na f)
+        anchor_rotary_pos_emb = rearrange(anchor_rotary_pos_emb, 'b h no na f -> b h (no na) f')
+
         # object self attention
 
         object_hiddens = [object_tokens]
@@ -297,7 +373,8 @@ class Rigidformer(Module):
         for attn_film, attn, ff_film, ff, attn_residual in self.self_attn_layers:
 
             filmed = attn_film(object_tokens, time_cond)
-            object_tokens = attn(filmed) + object_tokens
+
+            object_tokens = attn(filmed, rotary_pos_emb = object_rotary_pos_emb_with_registers) + object_tokens
 
             filmed = ff_film(object_tokens, time_cond)
             object_tokens = ff(object_tokens) + object_tokens
@@ -308,6 +385,8 @@ class Rigidformer(Module):
 
         # anchor cross attention
 
+        anchor_tokens, inverse_pack_objects_num_anchors = pack_with_inverse(anchor_tokens, 'b * d')
+
         anchor_hiddens = [anchor_tokens]
 
         object_contexts = [object_hiddens[layer] for layer in self.object_hidden_layers] # gather all the object self attention hidden layers for cross attending
@@ -317,7 +396,7 @@ class Rigidformer(Module):
             _, object_context = inverse_pack_registers(object_context) # remove register tokens
 
             filmed = attn_film(anchor_tokens, time_cond)
-            anchor_tokens = attn(filmed, context = object_context) + anchor_tokens
+            anchor_tokens = attn(filmed, rotary_pos_emb = anchor_rotary_pos_emb, context_rotary_pos_emb = object_rotary_pos_emb, context = object_context) + anchor_tokens
 
             filmed = ff_film(anchor_tokens, time_cond)
             anchor_tokens = ff(filmed) + anchor_tokens
@@ -325,6 +404,8 @@ class Rigidformer(Module):
             anchor_hiddens.append(anchor_tokens)
 
             anchor_tokens = attn_residual(anchor_hiddens)
+
+        anchor_tokens = inverse_pack_objects_num_anchors(anchor_tokens)
 
         pred_acc = self.to_acc_pred(anchor_tokens)
 
@@ -345,7 +426,13 @@ class Rigidformer(Module):
         if not return_loss:
             return pred
 
-        delta_times_squared = rearrange(delta_times_squared, 'b -> b 1 1')
+        max_num_objects = anchor_pos.shape[1]
+
+        delta_times_squared = repeat(delta_times_squared, 'b -> (b no) 1 1', no = max_num_objects)
+
+        # flatten batch and num objects into one dimension for kabsch
+
+        anchor_pos, anchor_pos_next, anchor_pos_prev, pred_acc, pred_pos_next = (rearrange(t, 'b no na p -> (b no) na p') for t in (anchor_pos, anchor_pos_next, anchor_pos_prev, pred_acc, pred_pos_next))
 
         # calculate loss with roma + kabsch
 
