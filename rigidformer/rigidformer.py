@@ -193,13 +193,19 @@ class FiLM(Module):
 class AttentionResidualPool(Module):
     def __init__(
         self,
-        dim
+        dim,
+        dim_head = 16
     ):
         super().__init__()
-        self.scale = dim ** -0.5
+        assert divisible_by(dim, dim_head)
+        heads = dim // dim_head
+        self.scale = dim_head ** -0.5
         self.queries = nn.Parameter(torch.randn(dim) * 1e-2)
 
         self.key_rmsnorm = nn.RMSNorm(dim)
+
+        self.split_heads = Rearrange('... (h d) -> ... h d', h = heads)
+        self.merge_heads = Rearrange('... h d -> ... (h d)')
 
     def forward(
         self,
@@ -213,15 +219,19 @@ class AttentionResidualPool(Module):
 
         q, k, v = self.queries, self.key_rmsnorm(layer_hiddens), layer_hiddens
 
+        q, k, v = tuple(self.split_heads(t) for t in (q, k, v))
+
         q = q * self.scale
 
         # attention
 
-        sim = einsum(q, k, 'd, b n l d -> b n l')
+        sim = einsum(q, k, 'h d, b n l h d -> b n h l')
 
-        attn = sim.softmax(dim = -1)
+        attn = sim.sigmoid()
 
-        out = einsum(attn, v, 'b n l, b n l d -> b n d')
+        out = einsum(attn, v, 'b n h l, b n l h d -> b n h d')
+
+        out = self.merge_heads(out)
 
         return out
 
