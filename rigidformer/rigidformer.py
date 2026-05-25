@@ -19,7 +19,7 @@ import roma
 
 # constants
 
-Predictions = namedtuple('Predictions', ('acceleration', 'positions'))
+Predictions = namedtuple('Predictions', ('acceleration', 'positions', 'anchor_indices'))
 
 Losses = namedtuple('Losses', ('acceleration', 'position'))
 
@@ -44,6 +44,43 @@ def divisible_by(num, den):
 
 def l1norm(t):
     return F.normalize(t, dim = -1, p = 1)
+
+# naive fps
+
+@torch.no_grad()
+def naive_farthest_point_sample(
+    positions,  # (... n d)
+    num_points
+):
+    positions, inverse_pack = pack_with_inverse(positions, '* n p')
+    device, batch, max_num_points, d = positions.device, *positions.shape
+
+    sampled = torch.empty((batch, num_points), device = device, dtype = torch.long)
+
+    # first one is random
+
+    sampled[:, 0] = torch.randint(0, max_num_points, (batch,), device = device)
+
+    # iterate through remaining, picking the farthest point from the remaining
+
+    for i in range(num_points - 1):
+        is_first = i == 0
+        next_i = i + 1
+
+        last_sampled_indices = repeat(sampled[:, i:next_i], '... -> ... d', d = d)
+        last_pos = positions.gather(-2, last_sampled_indices)
+
+        next_distance = torch.cdist(last_pos, positions)[:, 0]
+
+        if is_first:
+            min_distances = next_distance
+        else:
+            min_distances = torch.minimum(min_distances, next_distance)
+
+        next_sampled = min_distances.argmax(dim = -1)
+        sampled[:, next_i] = next_sampled
+
+    return inverse_pack(sampled, '* na')
 
 # 3d axial rotary embeddings
 # the anchor rope mentioned is simply where they mean pool rotary embeddings for the 4 anchors, iiuc
@@ -291,6 +328,7 @@ class Rigidformer(Module):
         num_register_tokens = 16,
         object_self_attn_depth = 4,
         anchor_cross_attn_depth = 4,
+        num_anchors = 4,
         object_hidden_layers: tuple[int, ...] = (0, 1, 2, 4),  # the hidden object layer outputs that the anchor decoder cross attends to
         pos_loss_weight = 10.,
         acc_loss_weight = 1.,
@@ -362,7 +400,9 @@ class Rigidformer(Module):
         self.num_register_tokens = num_register_tokens
         self.register_tokens = Parameter(torch.randn(num_register_tokens, dim) * 1e-2)
 
-        # anchor cross attention related
+        # anchor related
+
+        self.num_anchors = num_anchors # if anchor_indices not passed in, will do naive fps
 
         assert object_self_attn_depth in object_hidden_layers, '`object_hidden_layers` should attend to the output of the object transformer ({object_self_attn_depth})'
         assert all([0 <= l <= object_self_attn_depth for l in object_hidden_layers])
@@ -420,6 +460,11 @@ class Rigidformer(Module):
         anchor_indices = None,          # (b no na)
     ):
         batch, max_num_objects = object_pos.shape[:2]
+
+        # maybe fps
+
+        if not exists(anchor_indices):
+            anchor_indices = naive_farthest_point_sample(object_pos, self.num_anchors)
 
         # validate inputs
 
@@ -542,7 +587,7 @@ class Rigidformer(Module):
 
             rigid_object_pos_next = einx.add('b no c, b no n c', T, einsum(object_pos, R, 'b no n c1, b no c2 c1 -> b no n c2'))
 
-            pred = Predictions(pred_acc, rigid_object_pos_next)
+            pred = Predictions(pred_acc, rigid_object_pos_next, anchor_indices)
 
         if not return_loss:
             return pred

@@ -3,7 +3,10 @@ import torch
 import pytest
 param = pytest.mark.parametrize
 
-def test_rigidformer():
+@param('fps', (False, True))
+def test_rigidformer(
+    fps
+):
     from rigidformer.rigidformer import Rigidformer, RigidformerRolloutWrapper
 
     object_pos = torch.randn(2, 2, 256, 3)
@@ -22,13 +25,17 @@ def test_rigidformer():
         hierarchical_encoder = Reduce('b no n d -> b no d', 'mean') # mock before building out pointnet++ and platonic transformer
     )
 
+    kwargs = dict()
+    if not fps:
+        kwargs.update(anchor_indices = anchor_indices)
+
     loss, loss_breakdown = rigidformer(
         delta_times = delta_times,
         vertex_properties = vertex_properties,
         object_pos = object_pos,
         object_pos_prev = object_pos_prev,
         object_pos_next = object_pos_next,
-        anchor_indices = anchor_indices
+        **kwargs
     )
 
     loss.backward()
@@ -40,7 +47,7 @@ def test_rigidformer():
         delta_times = delta_times,
         vertex_properties = vertex_properties,
         object_positions = [object_pos_prev, object_pos],
-        anchor_indices = anchor_indices
+        **kwargs
     )
 
     assert len(object_positions) == 6
