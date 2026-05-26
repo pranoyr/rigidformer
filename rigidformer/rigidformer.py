@@ -4,7 +4,7 @@ from collections import namedtuple
 
 import torch
 import torch.nn.functional as F
-from torch import nn, cat, stack, tensor, is_tensor, Tensor
+from torch import nn, cat, stack, cdist, tensor, is_tensor, Tensor
 from torch.nn import Module, ModuleList, Linear, Parameter
 
 import einx
@@ -18,6 +18,8 @@ from x_mlps_pytorch import MLP
 import roma
 
 # constants
+
+INF = float('inf')
 
 Predictions = namedtuple('Predictions', ('anchor_acc', 'object_pos_next'))
 
@@ -46,6 +48,57 @@ def divisible_by(num, den):
 
 def l1norm(t):
     return F.normalize(t, dim = -1, p = 1)
+
+# nearest neighbor displacement - accounts for ground plane
+
+@torch.no_grad()
+def nearest_neighbor_displacement(
+    object_pos,     # (b no n 3)
+    mask = None,    # (b no n)
+    ground_z = 0.
+):
+    """for each vertex, displacement vector to the closest point on another object or the ground plane"""
+
+    _, num_objects, num_points, _ = object_pos.shape
+    total_points = num_objects * num_points
+
+    # ground plane as default nearest surface - displacement is purely in z
+
+    ground_z_disp = rearrange(ground_z - object_pos[..., 2], '... -> ... 1')
+    ground_disp = F.pad(ground_z_disp, (2, 0))
+
+    # flatten all points and compute pairwise distances per object against all points
+
+    all_pos = rearrange(object_pos, 'b no n p -> b (no n) p')
+    dists = cdist(object_pos, rearrange(all_pos, 'b m p -> b 1 m p'))  # (b, no, n, total_points)
+
+    # mask out same-object points with block diagonal
+
+    self_mask = torch.eye(num_objects, device = object_pos.device, dtype = torch.bool)
+    self_mask = repeat(self_mask, 'i j -> 1 i 1 (j n)', n = num_points)
+    dists.masked_fill_(self_mask, INF)
+
+    # mask out invalid points
+
+    if exists(mask):
+        packed_mask = rearrange(mask, 'b no n -> b (no n)')
+        dists = einx.where('b m, b no n m, -> b no n m', packed_mask, dists, INF)
+
+    # concat ground distance and find nearest
+
+    dists = cat((dists, ground_z_disp.abs()), dim = -1)
+    other_dist, other_idx = dists.min(dim = -1)
+
+    # get object displacement (clamp idx to safely avoid out of bounds if ground is nearest)
+
+    safe_idx = repeat(other_idx.clamp(max = total_points - 1), 'b no n -> b (no n) p', p = 3)
+    other_pos = all_pos.gather(1, safe_idx)
+    other_disp = rearrange(other_pos, 'b (no n) p -> b no n p', no = num_objects) - object_pos
+
+    # use ground displacement where ground was closest
+
+    is_ground = other_idx == total_points
+    return einx.where('b no n, b no n p, b no n p -> b no n p', is_ground, ground_disp, other_disp)
 
 # naive fps
 
@@ -81,7 +134,7 @@ def naive_farthest_point_sample(
         last_sampled_indices = repeat(sampled[:, i:next_i], '... -> ... d', d = d)
         last_pos = positions.gather(-2, last_sampled_indices)
 
-        next_distance = torch.cdist(last_pos, positions)[:, 0]
+        next_distance = cdist(last_pos, positions)[:, 0]
 
         if is_first:
             min_distances = next_distance
@@ -156,7 +209,7 @@ class PointNetSetAbstract(Module):
 
         # knn
 
-        dist = torch.cdist(new_pos, pos)
+        dist = cdist(new_pos, pos)
         _, knn_indices = dist.topk(self.num_samples, dim = -1, largest = False)
 
         grouped_pos = pos.gather(1, repeat(knn_indices, 'b m k -> b (m k) p', p = 3))
@@ -246,7 +299,7 @@ class AxialRotaryEmbeddings(Module):
 
 def rotate_half(x):
     x1, x2 = x.chunk(2, dim = -1)
-    return torch.cat((-x2, x1), dim = -1)
+    return cat((-x2, x1), dim = -1)
 
 def apply_rotary_pos_emb(pos, t):
     return t * pos.cos() + rotate_half(t) * pos.sin()
@@ -286,7 +339,7 @@ class AnchorVertexPool(Module):
         object_pos, inverse_pack = pack_with_inverse(object_pos, '* n p')
         packed_anchor_pos, _ = pack_with_inverse(anchor_pos, '* n p')
 
-        distance = torch.cdist(packed_anchor_pos, object_pos)
+        distance = cdist(packed_anchor_pos, object_pos)
 
         weights = (-distance / self.sigma).exp()
 
@@ -520,7 +573,7 @@ class Rigidformer(Module):
 
         # vertex encoder
 
-        self.vertex_encoder = MLP(3 + 3 + vertex_properties_dim, dim * 2, dim)
+        self.vertex_encoder = MLP(3 + 3 + 3 + vertex_properties_dim, dim * 2, dim)
 
         if not exists(hierarchical_encoder):
             hierarchical_encoder = PointNet(dim = dim, dim_out = dim)
@@ -667,7 +720,19 @@ class Rigidformer(Module):
         if vertex_properties.ndim == 3: # (b, no, d_attr)
             vertex_properties = repeat(vertex_properties, 'b no d -> b no n d', n = object_pos.shape[-2])
 
-        vertex_features = torch.cat((velocity, reference_offset, vertex_properties), dim = -1)
+        combined_mask = None
+        if exists(object_mask) and exists(object_point_mask):
+            combined_mask = einx.logical_and('b no, b no n -> b no n', object_mask, object_point_mask)
+        elif exists(object_mask):
+            combined_mask = repeat(object_mask, 'b no -> b no n', n = object_pos.shape[-2])
+        elif exists(object_point_mask):
+            combined_mask = object_point_mask
+
+        # nearest neighbor displacement to other object or ground plane - section 3.1 of paper
+
+        nearest_neighbor_disp = nearest_neighbor_displacement(object_pos, mask = combined_mask)
+
+        vertex_features = cat((nearest_neighbor_disp, velocity, reference_offset, vertex_properties), dim = -1)
         vertex_tokens = self.vertex_encoder(vertex_features)
 
         # hierarchical encoder - pointnet++ or custom
