@@ -19,7 +19,9 @@ import roma
 
 # constants
 
-Predictions = namedtuple('Predictions', ('acceleration', 'positions', 'anchor_indices'))
+Predictions = namedtuple('Predictions', ('anchor_acc', 'object_pos_next'))
+
+Intermediates = namedtuple('Intermediates', ('anchor_indices',))
 
 Losses = namedtuple('Losses', ('acceleration', 'position'))
 
@@ -630,6 +632,7 @@ class Rigidformer(Module):
         anchor_indices = None,          # (b no na)
         object_point_lens = None,       # (b no)
         object_lens = None,             # (b)
+        return_intermediates = False
     ):
         batch, max_num_objects = object_pos.shape[:2]
 
@@ -771,10 +774,13 @@ class Rigidformer(Module):
 
             rigid_object_pos_next = einx.add('b no c, b no n c', T, einsum(object_pos, R, 'b no n c1, b no c2 c1 -> b no n c2'))
 
-            pred = Predictions(pred_acc, rigid_object_pos_next, anchor_indices)
+            pred = Predictions(pred_acc, rigid_object_pos_next)
 
         if not return_loss:
-            return pred
+            if not return_intermediates:
+                return pred
+
+            return pred, Intermediates(anchor_indices)
 
         delta_times_squared = repeat(delta_times_squared, 'b -> b 1 1 1')
 
@@ -812,7 +818,12 @@ class Rigidformer(Module):
             pos_loss * self.pos_loss_weight
         )
 
-        return total_loss, Losses(acc_loss, pos_loss)
+        ret = (total_loss, Losses(acc_loss, pos_loss))
+
+        if not return_intermediates:
+            return ret
+
+        return *ret, Intermediates(anchor_indices)
 
 # rollout wrapper, for inference but also for training
 
@@ -889,6 +900,6 @@ class RigidformerRolloutWrapper(Module):
                 object_lens = object_lens
             )
 
-            object_positions.append(one_step_pred.positions)
+            object_positions.append(one_step_pred.object_pos_next)
 
         return object_positions

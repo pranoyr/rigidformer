@@ -44,12 +44,23 @@ loss, loss_breakdown = model(
     vertex_properties = vertex_properties,
     object_pos = object_pos,
     object_pos_prev = object_pos_prev,
-    object_pos_next = object_pos_next
+    object_pos_next = object_pos_next  # target
 )
 
 loss.backward()
 
-# inference (rollout)
+# if `object_pos_next` not passed in, will return predictions
+
+pred = model(
+    delta_times = delta_times,
+    vertex_properties = vertex_properties,
+    object_pos = object_pos,
+    object_pos_prev = object_pos_prev,
+)
+
+assert pred.object_pos_next.shape == object_pos.shape
+
+# rollout multiple steps with a wrapper
 
 wrapper = RigidformerRolloutWrapper(model)
 
@@ -61,7 +72,7 @@ rollout_positions = wrapper(
 )
 
 # rollout_positions is a list of length 12 tensors of shape (batch, num_objects, num_points, 3)
-# includes the 2 initial mock positions
+# includes the 2 initial positions
 ```
 
 ## Citations
