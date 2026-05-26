@@ -895,11 +895,13 @@ class Rigidformer(Module):
 class RigidformerRolloutWrapper(Module):
     def __init__(
         self,
-        rigidformer: Rigidformer
+        rigidformer: Rigidformer,
+        cache_anchor_indices = True
     ):
         super().__init__()
 
         self.rigidformer = rigidformer
+        self.cache_anchor_indices = cache_anchor_indices
 
     def rand_steps(
         self,
@@ -926,6 +928,7 @@ class RigidformerRolloutWrapper(Module):
         anchor_indices = None,          # (b no na)
         object_point_lens = None,       # (b no)
         object_lens = None,             # (b)
+        return_intermediates = False
     ):
 
         # either fixed delta times for num steps
@@ -954,7 +957,7 @@ class RigidformerRolloutWrapper(Module):
 
             *_, object_pos_prev, object_pos = object_positions
 
-            one_step_pred = self.rigidformer(
+            one_step_pred, intermediates = self.rigidformer(
                 delta_times = one_delta_time,
                 object_pos = object_pos,
                 object_pos_prev = object_pos_prev,
@@ -962,9 +965,18 @@ class RigidformerRolloutWrapper(Module):
                 vertex_properties = vertex_properties,
                 anchor_indices = anchor_indices,
                 object_point_lens = object_point_lens,
-                object_lens = object_lens
+                object_lens = object_lens,
+                return_intermediates = True
             )
+
+            # anchor indices are generated via FPS on first step, then reused for all subsequent steps
+
+            if not exists(anchor_indices):
+                anchor_indices = intermediates.anchor_indices
 
             object_positions.append(one_step_pred.object_pos_next)
 
-        return object_positions
+        if not return_intermediates:
+            return object_positions
+
+        return object_positions, Intermediates(anchor_indices)

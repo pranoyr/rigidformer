@@ -14,7 +14,7 @@ $ pip install rigidformer
 
 ```python
 import torch
-from rigidformer import Rigidformer, RigidformerRolloutWrapper
+from rigidformer import Rigidformer
 
 # instantiate model
 
@@ -62,13 +62,15 @@ assert pred.object_pos_next.shape == object_pos.shape
 
 # rollout multiple steps with a wrapper
 
+from rigidformer import RigidformerRolloutWrapper
+
 wrapper = RigidformerRolloutWrapper(model)
 
 rollout_positions = wrapper(
+    num_steps = 10,
     delta_times = delta_times,
     vertex_properties = vertex_properties,
-    object_positions = [object_pos_prev, object_pos],
-    num_steps = 10
+    object_positions = [object_pos_prev, object_pos]
 )
 
 # rollout_positions is a list of length 12 tensors of shape (batch, num_objects, num_points, 3)
