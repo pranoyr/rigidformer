@@ -804,12 +804,8 @@ class Rigidformer(Module):
         acc_loss = loss_fn(pred_acc, anchor_acc) + loss_fn(pred_acc_rigid, anchor_acc)
         pos_loss = loss_fn(pred_anchor_pos_next, anchor_pos_next) + loss_fn(pred_pos_next_rigid, anchor_pos_next)
 
-        if exists(object_mask):
-            acc_loss = masked_mean(acc_loss, object_mask)
-            pos_loss = masked_mean(pos_loss, object_mask)
-        else:
-            acc_loss = acc_loss.mean()
-            pos_loss = pos_loss.mean()
+        acc_loss = masked_mean(acc_loss, object_mask)
+        pos_loss = masked_mean(pos_loss, object_mask)
 
         total_loss = (
             acc_loss * self.acc_loss_weight +
